@@ -925,9 +925,9 @@ public:
 
 private:
 	threadJobList_t				jobLists[MAX_JOBLISTS];	// cyclic buffer with job lists
-	unsigned int				firstJobList;			// index of the last job list the thread grabbed
-	unsigned int				lastJobList;			// index where the next job list to work on will be added
-	idSysMutex					addJobMutex;
+	interlockedInt_t			firstJobList;			// index of the last job list the thread grabbed
+	// Consider cache line padding between these 2 counters to prevent false sharing.
+	interlockedInt_t			lastJobList;			// index where the next job list to work on will be added
 
 	unsigned int				threadNum;
 
@@ -968,18 +968,28 @@ void idJobThread::Start( core_t core, unsigned int threadNum ) {
 idJobThread::AddJobList
 ========================
 */
+
 void idJobThread::AddJobList( idParallelJobList_Threads * jobList ) {
-	// must lock because multiple threads may try to add new job lists at the same time
-	addJobMutex.Lock();
-	// wait until there is space available because in rare cases multiple versions of the same job lists may still be queued 
-	while( lastJobList - firstJobList >= MAX_JOBLISTS ) {
-		Sys_Yield();
-	}
-	assert( lastJobList - firstJobList < MAX_JOBLISTS );
-	jobLists[lastJobList & ( MAX_JOBLISTS - 1 )].jobList = jobList;
-	jobLists[lastJobList & ( MAX_JOBLISTS - 1 )].version = jobList->GetVersion();
-	lastJobList++;
-	addJobMutex.Unlock();
+
+	int slot;
+	do {
+		slot = lastJobList;
+		if ( (slot - firstJobList) - MAX_JOBLISTS < 0 ) { // Handle wrapping case
+			Sys_Yield();
+		}
+		else if ( Sys_InterlockedCompareExchange( lastJobList, slot, slot + 1 ) ) {
+			break;
+		}
+	} while ( 1 );
+
+	assert( slot - firstJobList < MAX_JOBLISTS );
+	jobLists[slot & ( MAX_JOBLISTS - 1 )].jobList = jobList;
+	jobLists[slot & ( MAX_JOBLISTS - 1 )].version = jobList->GetVersion();
+
+	// This needs to be a store with release semantics.  
+	// E.g. atomic<int>::store(slot, std::memory_order_release)
+	// Or some other intrinsic to prevent reordering
+	jobLists[slot & ( MAX_JOBLISTS - 1 )].published = slot;
 }
 
 /*
@@ -995,14 +1005,21 @@ int idJobThread::Run() {
 	while ( !IsTerminating() ) {
 
 		// fetch any new job lists and add them to the local list
-		if ( numJobLists < MAX_JOBLISTS && firstJobList < lastJobList ) {
+		if ( numJobLists < MAX_JOBLISTS && firstJobList < lastJobList && 
+			 // This needs to provide a load with acquire semantices
+			 // E.g. atomic<int>::store(slot, std::memory_order_acquire)
+			 jobLists[firstJobList & ( MAX_JOBLISTS - 1 ) ].published == firstJobList ) {
+
 			threadJobListState[numJobLists].jobList = jobLists[firstJobList & ( MAX_JOBLISTS - 1 )].jobList;
 			threadJobListState[numJobLists].version = jobLists[firstJobList & ( MAX_JOBLISTS - 1 )].version;
 			threadJobListState[numJobLists].signalIndex = 0;
 			threadJobListState[numJobLists].lastJobIndex = 0;
 			threadJobListState[numJobLists].nextJobIndex = -1;
 			numJobLists++;
-			firstJobList++;
+			// This is overkill.  As only one thread is update firstLobList
+			// it should only need a ordering fence, e.g.
+			// atomic<int>::store(firstJobList + 1, std::memory_order_release)
+			Sys_InterlockedIncrement( firstJobList ); 
 		}
 		if ( numJobLists == 0 ) {
 			break;
